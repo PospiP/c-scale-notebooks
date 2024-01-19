@@ -5,8 +5,14 @@ import numpy as np
 import shapefile
 import io
 import os
+import re
+import json
 import geojson
 import rasterio
+import pyproj
+import fiona
+from rasterio.mask import mask
+from rasterio import warp
 from rasterio.coords import BoundingBox
 from shapely.geometry import shape
 import matplotlib.pyplot as plt
@@ -15,6 +21,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from rasterio.enums import Resampling
 from rasterio.plot import adjust_band
+
 
 def get_cloud_cover_ts(gdf: gpd.geodataframe.GeoDataFrame) -> pd.core.series.Series:
     ts = None
@@ -124,6 +131,102 @@ def pol_to_bounding_box(pol):
                        np.max(arr[:,0]),
                        np.max(arr[:,1]))
 
+def bbox_converter(file, new_file, epsg):
+    # Loading coordinates lat/long
+    with open(file) as f:
+        gj = geojson.load(f)
+    
+    cord = gj['features'][0]['geometry']['coordinates']
+
+    k = 0
+    cord_list = [[0] for i in range(len(cord[0]))]
+    for i in range(len(cord)):
+        for j in range(len(cord[0])):
+            cord_list[k] = cord[i][j]
+            k += 1
+
+    bbox = pol_to_bounding_box(cord_list)
+    
+    bounds_trans = warp.transform_bounds({'init': 'epsg:4326'},"epsg:"+str(epsg),*bbox)
+    pol_bounds_trans = generate_polygon(bounds_trans)
+    
+    k = 0
+    n = 1
+    m = len(pol_bounds_trans)
+    matrix_coord = [[0]*m for i in range(n)]
+    for cor in pol_bounds_trans:
+        matrix_coord[0][k] = pol_bounds_trans[k]
+        k += 1
+    
+    with open(file, 'r') as f:
+        data = json.load(f)
+
+    data['features'][0]['geometry']['coordinates'] = matrix_coord
+    
+    with open(new_file, 'w+') as f:
+        json.dump(data, f)
+    
+    print("The file {} has been saved!".format(new_file))
+
+"""
+This function clipped all images in specified folder according to the geojson file and save output to specified folder
+"""
+
+def clipper(image_path, geojson, new_folder, L2A = "no", B09 = "no", whole = "no"):
+    file_list = os.listdir(image_path)
+    file_list.sort()
+    
+    if ".ipynb_checkpoints" in file_list:
+        indx = file_list.index(".ipynb_checkpoints")
+        del file_list[indx]
+
+    # use fiona to open our map ROI GeoJSON
+    with fiona.open(geojson) as f:
+        aoi = [feature["geometry"] for feature in f]
+        
+    if B09 == "no":    
+        # Load every image from the list
+        k = 0
+        for image in file_list:
+            with rasterio.open(image_path + image) as img:
+                clipped, transform = mask(img, aoi, crop=True)
+    
+            meta = img.meta.copy()
+    
+            meta.update({"driver": "GTiff", "transform": transform,"height":clipped.shape[1],"width":clipped.shape[2]})
+    
+            # Save clipped images in the file
+            if L2A == "yes":
+                inilist = [i.start() for i in re.finditer("_",file_list[k])]
+                new_fold = new_folder + file_list[k][inilist[1]+1:inilist[2]] + '.tif'
+            elif whole == "no":
+                new_fold = new_folder + file_list[k][file_list[k].rfind('_')+1:file_list[k].rfind('.')] + '.tif'
+            else:
+                new_fold = new_folder + file_list[k]
+            
+            with rasterio.open(new_fold, 'w', **meta) as dst:
+                dst.write(clipped)
+                
+            k += 1
+    else:
+        name09 = ([s for s in file_list if "B09" in s])
+        
+        with rasterio.open(image_path + name09[0]) as img:
+                clipped, transform = mask(img, aoi, crop=True)
+    
+        meta = img.meta.copy()
+    
+        meta.update({"driver": "GTiff", "transform": transform,"height":clipped.shape[1],"width":clipped.shape[2]})
+        
+        inilist = [i.start() for i in re.finditer("_",name09[0])]
+        new_fold = new_folder + name09[0][inilist[1]+1:inilist[2]] + '.tif'
+        
+        with rasterio.open(new_fold, 'w', **meta) as dst:
+                dst.write(clipped)
+        
+    print("All clipped images are saved in {} folder!".format(new_folder))
+
+
 def resampling(folder, file_template, file_resize, upscale_factor):
     upscale_factor = upscale_factor
     
@@ -213,3 +316,40 @@ def plot_masked_rgb(red, green, blue, mask, color_mask=(1, 0, 0), transparency=0
     rgb = np.stack([red, green, blue], axis=2)
     
     return rgb
+
+""" 
+Converts coordinates from GPS coorodinates (latitude/longitude - epsg:4326) from geojson file to any chosen epsg projection  
+and saving these new coordinates to the new geojson file (new_file)
+"""
+
+def coor_converter(file, new_file, epsg):
+    # Transformation from GPS coordinates to desired epsg projection
+    transformer = pyproj.Transformer.from_crs("epsg:4326","epsg:"+str(epsg))
+    
+    # Open geojson file with GPS coordinates
+    with open(file) as f:
+        gj = geojson.load(f)
+    
+    # Load coordinates from geojson file
+    cdnts = gj['features'][0]['geometry']['coordinates']
+    
+    # Transformation of coordinates
+    k = 0
+    n = len(cdnts)
+    m = len(cdnts[0])
+    trans_coord = [[0]*m for i in range(n)]
+    for i in range(len(cdnts)):
+        for j in range(len(cdnts[0])):
+            [x1, y1] = cdnts[i][j]
+            trans_coord[0][k] = transformer.transform(y1, x1)
+            k += 1
+    
+    with open(file, 'r') as f:
+        data = json.load(f)
+
+    data['features'][0]['geometry']['coordinates'] = trans_coord
+    
+    with open(new_file, 'w+') as f:
+        json.dump(data, f)
+    
+    print("The file {} has been saved!".format(new_file))
